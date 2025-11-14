@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-docx
+spacy
+ru-core-news-sm==3.7.0
+tqdm
