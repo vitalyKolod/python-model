@@ -1,68 +1,160 @@
 from fastapi import FastAPI, UploadFile, File
-from parser.splitter import split_scenes
+from fastapi.middleware.cors import CORSMiddleware
+
 from parser.logic import analyze_scene
-from pydantic import BaseModel
-import uvicorn
-from docx import Document  # библиотека для работы с .docx
-import io
+from parser.splitter import split_scenes
 
-app = FastAPI(title="Scenario Parser API")
+from docx import Document
+from io import BytesIO
+import pdfplumber
+from striprtf.striprtf import rtf_to_text
+import re
 
-# -----------------------------
-# POST /parse_text
-# -----------------------------
-class ScenarioRequest(BaseModel):
-    text: str
+app = FastAPI()
 
-@app.post("/parse_text")
-def parse_text(request: ScenarioRequest):
-    scenes = split_scenes(request.text)
-    result = []
-    for scene in scenes:
-        lines = scene.strip().split("\n")
-        header = lines[0].strip()
-        scene_text = "\n".join(lines[1:]).strip()
-        analysis = analyze_scene(scene_text)
-        result.append({
-            "scene_header": header,
-            "analysis": analysis
-        })
-    return {"scenes": result}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# -----------------------------
-# POST /parse_file
-# -----------------------------
+
+# ============================================================
+# 📌 DOCX ПОЛНОСТЬЮ СЛИВАЕТ ВСЕ RUN'ы В ЕДИНУЮ ЛИНИЮ
+# ============================================================
+
+def extract_docx_text(content: bytes) -> str:
+    doc = Document(BytesIO(content))
+
+    lines = []
+
+    for p in doc.paragraphs:
+        full = "".join(run.text for run in p.runs)
+        full = full.replace("\u00A0", " ").strip()
+
+        # Word может делать сцена № как буквы по одной → склеиваем вручную
+        full = full.replace("С Ц Е Н А", "СЦЕНА")
+        full = full.replace("С Ц Е Н А ", "СЦЕНА ")
+        full = full.replace("С  Ц  Е  Н  А", "СЦЕНА")
+
+        if full:
+            lines.append(full)
+
+    # Таблицы Word
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    full = "".join(run.text for run in p.runs)
+                    full = full.replace("\u00A0", " ").strip()
+
+                    full = full.replace("С Ц Е Н А", "СЦЕНА")
+                    full = full.replace("С Ц Е Н А ", "СЦЕНА ")
+
+                    if full:
+                        lines.append(full)
+
+    text = "\n".join(lines)
+
+    # Нормализация
+    text = text.replace("\u00A0", " ")
+    text = text.replace("\u2028", "\n")
+    text = re.sub(r"\n+", "\n", text)
+    text = re.sub(r"[ ]+", " ", text)
+
+    return text.strip()
+
+
+# ============================================================
+# 📌 PDF
+# ============================================================
+
+def extract_pdf_text(content: bytes) -> str:
+    result = ""
+
+    with pdfplumber.open(BytesIO(content)) as pdf:
+        for page in pdf.pages:
+            tx = page.extract_text()
+            if not tx:
+                continue
+
+            tx = tx.replace("-\n", "")
+            tx = tx.replace("\n", " ")
+
+            result += tx + " "
+
+    result = result.replace("\u00A0", " ")
+    return " ".join(result.split())
+
+
+# ============================================================
+# 📌 Общий экстрактор
+# ============================================================
+
+def extract_text_from_file(filename: str, content: bytes) -> str:
+    ext = filename.lower().split(".")[-1]
+
+    if ext == "txt":
+        try:
+            return content.decode("utf-8")
+        except:
+            return content.decode("cp1251", errors="ignore")
+
+    if ext == "docx":
+        return extract_docx_text(content)
+
+    if ext == "pdf":
+        return extract_pdf_text(content)
+
+    if ext == "rtf":
+        try:
+            return rtf_to_text(content.decode("utf-8", errors="ignore"))
+        except:
+            return rtf_to_text(content.decode("cp1251", errors="ignore"))
+
+    return ""
+
+
+# ============================================================
+# 📌 API
+# ============================================================
+
 @app.post("/parse_file")
 async def parse_file(file: UploadFile = File(...)):
     content = await file.read()
-    text = ""
+    text = extract_text_from_file(file.filename, content)
 
-    if file.filename.endswith(".docx"):
-        # читаем Word-документ
-        doc = Document(io.BytesIO(content))
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        text = "\n".join(paragraphs)
-    else:
-        # читаем обычный текст
-        text = content.decode("utf-8")
+
 
     scenes = split_scenes(text)
     result = []
-    for scene in scenes:
-        lines = scene.strip().split("\n")
-        header = lines[0].strip()
-        scene_text = "\n".join(lines[1:]).strip()
-        analysis = analyze_scene(scene_text)
+
+    for header, body in scenes:
         result.append({
             "scene_header": header,
-            "analysis": analysis
+            "analysis": analyze_scene(body)
         })
+
     return {"scenes": result}
 
-# -----------------------------
-# Запуск через uvicorn
-# -----------------------------
+
+@app.post("/parse_text")
+async def parse_text(data: dict):
+    text = data.get("text", "")
+    scenes = split_scenes(text)
+
+    result = []
+    for header, body in scenes:
+        result.append({
+            "scene_header": header,
+            "analysis": analyze_scene(body)
+        })
+
+    return {"scenes": result}
+
+
 if __name__ == "__main__":
-    uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)
-
-
+    import uvicorn
+    print(">>> http://127.0.0.1:8000")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
